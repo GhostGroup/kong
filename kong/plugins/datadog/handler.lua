@@ -2,7 +2,6 @@ local BasePlugin       = require "kong.plugins.base_plugin"
 local basic_serializer = require "kong.plugins.log-serializers.basic"
 local statsd_logger    = require "kong.plugins.datadog.statsd_logger"
 
-
 local ngx_log       = ngx.log
 local ngx_timer_at  = ngx.timer.at
 local string_gsub   = string.gsub
@@ -10,94 +9,96 @@ local pairs         = pairs
 local string_format = string.format
 local NGX_ERR       = ngx.ERR
 
-
 local DatadogHandler    = BasePlugin:extend()
 DatadogHandler.PRIORITY = 10
 DatadogHandler.VERSION = "0.1.0"
 
-
-local get_consumer_id = {
-  consumer_id = function(consumer)
-    return consumer and string_gsub(consumer.id, "-", "_")
-  end,
-  custom_id   = function(consumer)
-    return consumer and consumer.custom_id
-  end,
-  username    = function(consumer)
-    return consumer and consumer.username
-  end
+local ConsumerId = {
+  consumer_id = function(consumer) return consumer and string_gsub(consumer.id, "-", "_") end,
+  custom_id   = function(consumer) return consumer and consumer.custom_id end,
+  username    = function(consumer) return consumer and consumer.username end
 }
 
+local function get_consumer_id(metric_config, message)
+  local consumer_id_func = ConsumerId[metric_config.consumer_identifier]
+  return consumer_id_func(message.consumer)
+end
 
-local metrics = {
-  status_count = function (api_name, message, metric_config, logger)
-    local fmt = string_format("%s.request.status", api_name,
-                       message.response.status)
+local CompoundMetrics = {}
+
+function CompoundMetrics.status_count(name_prefix, message, metric_config, logger, tags)
+  local fmt = string_format("%srequest.status", name_prefix, message.response.status)
+
+  logger:send_statsd(string_format("%s.%s", fmt, message.response.status),
+                     1, logger.stat_types.counter, metric_config.sample_rate, tags)
+
+  logger:send_statsd(string_format("%s.%s", fmt, "total"), 1,
+                     logger.stat_types.counter, metric_config.sample_rate, tags)
+end
+
+function CompoundMetrics.unique_users(name_prefix, message, metric_config, logger, tags)
+  local consumer_id = get_consumer_id(metric_config, message)
+  if consumer_id then
+    local stat = string_format("%suser.uniques", name_prefix)
+    logger:send_statsd(stat, consumer_id, logger.stat_types.set, nil, tags)
+  end
+end
+
+function CompoundMetrics.request_per_user(name_prefix, message, metric_config, logger, tags)
+  local consumer_id = get_consumer_id(metric_config, message)
+
+  if consumer_id then
+    local stat = string_format("%suser.%s.request.count", name_prefix, consumer_id)
+    logger:send_statsd(stat, 1, logger.stat_types.counter, metric_config.sample_rate, tags)
+  end
+end
+
+function CompoundMetrics.status_count_per_user(name_prefix, message, metric_config, logger, tags)
+  local consumer_id = get_consumer_id(metric_config, message)
+
+  if consumer_id then
+    local fmt = string_format("%suser.%s.request.status", name_prefix, consumer_id)
 
     logger:send_statsd(string_format("%s.%s", fmt, message.response.status),
-                       1, logger.stat_types.counter,
-                       metric_config.sample_rate, metric_config.tags)
+                       1, logger.stat_types.counter, metric_config.sample_rate, tags)
 
-    logger:send_statsd(string_format("%s.%s", fmt, "total"), 1,
-                       logger.stat_types.counter,
-                       metric_config.sample_rate, metric_config.tags)
-  end,
-  unique_users = function (api_name, message, metric_config, logger)
-    local get_consumer_id = get_consumer_id[metric_config.consumer_identifier]
-    local consumer_id     = get_consumer_id(message.consumer)
-
-    if consumer_id then
-      local stat = string_format("%s.user.uniques", api_name)
-
-      logger:send_statsd(stat, consumer_id, logger.stat_types.set,
-                         nil, metric_config.tags)
-    end
-  end,
-  request_per_user = function (api_name, message, metric_config, logger)
-    local get_consumer_id = get_consumer_id[metric_config.consumer_identifier]
-    local consumer_id     = get_consumer_id(message.consumer)
-
-    if consumer_id then
-      local stat = string_format("%s.user.%s.request.count", api_name, consumer_id)
-
-      logger:send_statsd(stat, 1, logger.stat_types.counter,
-                         metric_config.sample_rate, metric_config.tags)
-    end
-  end,
-  status_count_per_user = function (api_name, message, metric_config, logger)
-    local get_consumer_id = get_consumer_id[metric_config.consumer_identifier]
-    local consumer_id     = get_consumer_id(message.consumer)
-
-    if consumer_id then
-      local fmt = string_format("%s.user.%s.request.status", api_name, consumer_id)
-
-      logger:send_statsd(string_format("%s.%s", fmt, message.response.status),
-                         1, logger.stat_types.counter,
-                         metric_config.sample_rate, metric_config.tags)
-
-      logger:send_statsd(string_format("%s.%s", fmt,  "total"),
-                         1, logger.stat_types.counter,
-                         metric_config.sample_rate, metric_config.tags)
-    end
-  end,
-}
-
-
-local function log(premature, conf, message)
-  if premature then
-    return
+    logger:send_statsd(string_format("%s.%s", fmt, "total"),
+                       1, logger.stat_types.counter, metric_config.sample_rate, tags)
   end
+end
 
-  local api_name   = string_gsub(message.api.name, "%.", "_")
-  local stat_name  = {
-    request_size     = api_name .. ".request.size",
-    response_size    = api_name .. ".response.size",
-    latency          = api_name .. ".latency",
-    upstream_latency = api_name .. ".upstream_latency",
-    kong_latency     = api_name .. ".kong_latency",
-    request_count    = api_name .. ".request.count",
+local function merge_tags(tags, api_name)
+  local api_tag = "api_name:" .. api_name
+  if tags then
+    tags = {unpack(tags)}
+    tags[#tags+1] = api_tag
+  else
+    tags = { api_tag }
+  end
+  return tags
+end
+
+local function build_name_prefix(api_name, conf)
+  if conf.tag_api_name then
+    return ""
+  else
+    return api_name .. "."
+  end
+end
+
+local function build_stat_names(name_prefix)
+  return {
+    request_size     = name_prefix .. "request.size",
+    response_size    = name_prefix .. "response.size",
+    latency          = name_prefix .. "latency",
+    upstream_latency = name_prefix .. "upstream_latency",
+    kong_latency     = name_prefix .. "kong_latency",
+    request_count    = name_prefix .. "request.count",
   }
-  local stat_value = {
+end
+
+local function collect_stat_values(message)
+  return {
     request_size     = message.request.size,
     response_size    = message.response.size,
     latency          = message.latencies.request,
@@ -105,6 +106,12 @@ local function log(premature, conf, message)
     kong_latency     = message.latencies.kong,
     request_count    = 1,
   }
+end
+
+local function log(premature, conf, message)
+  if premature then
+    return
+  end
 
   local logger, err = statsd_logger:new(conf)
   if err then
@@ -112,25 +119,33 @@ local function log(premature, conf, message)
     return
   end
 
+  local api_name    = string_gsub(message.api.name, "%.", "_")
+  local name_prefix = build_name_prefix(api_name, conf)
+  local stat_name   = build_stat_names(name_prefix)
+  local stat_value  = collect_stat_values(message)
+
   for _, metric_config in pairs(conf.metrics) do
-    local metric = metrics[metric_config.name]
+    local metric_func = CompoundMetrics[metric_config.name]
 
-    if metric then
-      metric(api_name, message, metric_config, logger)
+    local tags = metric_config.tags
+    if conf.tag_api_name then
+      tags = merge_tags(tags, api_name)
+    end
 
+    if metric_func then
+      metric_func(name_prefix, message, metric_config, logger, tags)
     else
       local stat_name  = stat_name[metric_config.name]
       local stat_value = stat_value[metric_config.name]
 
       logger:send_statsd(stat_name, stat_value,
                          logger.stat_types[metric_config.stat_type],
-                         metric_config.sample_rate, metric_config.tags)
+                         metric_config.sample_rate, tags)
     end
   end
 
   logger:close_socket()
 end
-
 
 function DatadogHandler:new()
   DatadogHandler.super.new(self, "datadog")
@@ -138,7 +153,7 @@ end
 
 function DatadogHandler:log(conf)
   DatadogHandler.super.log(self)
-  
+
   -- unmatched apis are nil
   if not ngx.ctx.api then
     return
