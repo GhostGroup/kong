@@ -40,6 +40,11 @@ describe("Plugin: datadog (log)", function()
       hosts        = { "datadog4.com" },
       upstream_url = helpers.mock_upstream_url,
     })
+    local api5     = assert(helpers.dao.apis:insert {
+      name         = "dd5",
+      hosts        = { "datadog5.com" },
+      upstream_url = helpers.mock_upstream_url,
+    })
     assert(helpers.dao.plugins:insert {
       name   = "key-auth",
       api_id = api4.id
@@ -107,6 +112,28 @@ describe("Plugin: datadog (log)", function()
         host   = "127.0.0.1",
         port   = 9999,
         prefix = "prefix",
+      },
+    })
+    assert(helpers.dao.plugins:insert {
+      name   = "datadog",
+      api_id = api5.id,
+      config = {
+        host          = "127.0.0.1",
+        port          = 9999,
+        tag_api_name  = true,
+        metrics = {
+          {
+            name        = "status_count",
+            stat_type   = "counter",
+            sample_rate = 1,
+          },
+          {
+            name        = "latency",
+            stat_type   = "gauge",
+            sample_rate = 1,
+            tags        = {"T2:V2:V3,T4"},
+          },
+        },
       },
     })
 
@@ -281,6 +308,41 @@ describe("Plugin: datadog (log)", function()
     assert.contains("kong.dd3.request.status.200:1|c|#T1:V1", gauges)
     assert.contains("kong.dd3.request.status.total:1|c|#T1:V1", gauges)
     assert.contains("kong.dd3.latency:%d+|g|#T2:V2:V3,T4", gauges, true)
+  end)
+
+  it("logs metrics with tags with api name in tag", function()
+    local thread = threads.new({
+      function()
+        local socket = require "socket"
+        local server = assert(socket.udp())
+        server:settimeout(1)
+        server:setoption("reuseaddr", true)
+        server:setsockname("127.0.0.1", 9999)
+        local gauges = {}
+        for _ = 1, 3 do
+          gauges[#gauges+1] = server:receive()
+        end
+        server:close()
+        return gauges
+      end
+    })
+    thread:start()
+
+    local res = assert(client:send {
+      method = "GET",
+      path = "/status/200",
+      headers = {
+        ["Host"] = "datadog5.com"
+      }
+    })
+    assert.res_status(200, res)
+
+    local ok, gauges = thread:join()
+    assert.True(ok)
+    assert.equal(3, #gauges)
+    assert.contains("kong.request.status.200:1|c|#api_name:dd5", gauges)
+    assert.contains("kong.request.status.total:1|c|#api_name:dd5", gauges)
+    assert.contains("kong.latency:%d+|g|#T2:V2:V3,T4,api_name:dd5", gauges, true)
   end)
 
   it("should not return a runtime error (regression)", function()
