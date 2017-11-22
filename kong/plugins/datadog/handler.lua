@@ -13,20 +13,20 @@ local DatadogHandler    = BasePlugin:extend()
 DatadogHandler.PRIORITY = 10
 DatadogHandler.VERSION = "0.1.0"
 
-local ConsumerId = {
+local consumer_id_functions = {
   consumer_id = function(consumer) return consumer and string_gsub(consumer.id, "-", "_") end,
   custom_id   = function(consumer) return consumer and consumer.custom_id end,
   username    = function(consumer) return consumer and consumer.username end
 }
 
 local function get_consumer_id(metric_config, message)
-  local consumer_id_func = ConsumerId[metric_config.consumer_identifier]
+  local consumer_id_func = consumer_id_functions[metric_config.consumer_identifier]
   return consumer_id_func(message.consumer)
 end
 
-local CompoundMetrics = {}
+local metric_functions = {}
 
-function CompoundMetrics.status_count(name_prefix, message, metric_config, logger, tags)
+function metric_functions.status_count(name_prefix, message, metric_config, logger, tags)
   local fmt = string_format("%srequest.status", name_prefix, message.response.status)
 
   logger:send_statsd(string_format("%s.%s", fmt, message.response.status),
@@ -36,7 +36,7 @@ function CompoundMetrics.status_count(name_prefix, message, metric_config, logge
                      logger.stat_types.counter, metric_config.sample_rate, tags)
 end
 
-function CompoundMetrics.unique_users(name_prefix, message, metric_config, logger, tags)
+function metric_functions.unique_users(name_prefix, message, metric_config, logger, tags)
   local consumer_id = get_consumer_id(metric_config, message)
   if consumer_id then
     local stat = string_format("%suser.uniques", name_prefix)
@@ -44,7 +44,7 @@ function CompoundMetrics.unique_users(name_prefix, message, metric_config, logge
   end
 end
 
-function CompoundMetrics.request_per_user(name_prefix, message, metric_config, logger, tags)
+function metric_functions.request_per_user(name_prefix, message, metric_config, logger, tags)
   local consumer_id = get_consumer_id(metric_config, message)
 
   if consumer_id then
@@ -53,7 +53,7 @@ function CompoundMetrics.request_per_user(name_prefix, message, metric_config, l
   end
 end
 
-function CompoundMetrics.status_count_per_user(name_prefix, message, metric_config, logger, tags)
+function metric_functions.status_count_per_user(name_prefix, message, metric_config, logger, tags)
   local consumer_id = get_consumer_id(metric_config, message)
 
   if consumer_id then
@@ -125,7 +125,7 @@ local function log(premature, conf, message)
   local stat_value  = collect_stat_values(message)
 
   for _, metric_config in pairs(conf.metrics) do
-    local metric_func = CompoundMetrics[metric_config.name]
+    local metric_func = metric_functions[metric_config.name]
 
     local tags = metric_config.tags
     if conf.tag_api_name then
